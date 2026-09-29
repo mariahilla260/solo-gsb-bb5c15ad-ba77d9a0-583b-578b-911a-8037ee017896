@@ -35,13 +35,14 @@ app/
   calendar.py    日历事件汇总（text/calendar 单次 VEVENT 解析、TZID 折 UTC、夏令时诊断、跨邮件版本选择，纯只读）
   compare.py     两封邮件 MIME 树递归对齐比较（内容指纹配对、重排识别、歧义标记，纯只读）
   archive.py     整邮件附件 ZIP 打包（确定性条目/压缩、名称冲突改名、manifest.json，纯只读）
-  database.py    SQLite 建表、事务化写入、消息/节点/附件查询
+  unarchive.py   批量撤销归档：{id, 当前指纹} 凭据校验与预览/执行共用的影响计算（纯只读计算，删除在 database 单事务内）
+  database.py    SQLite 建表、事务化写入、消息/节点/附件查询与单事务级联删除
   errors.py      定位到节点的解析错误
   schemas.py     请求/响应模型
-tests/           416 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+tests/           438 个 pytest 用例（指纹稳定性、损坏输入、附件库、
                  整邮件 ZIP、cid 引用审计、展示正文选择、安全策略评估、
                  DSN 投递状态、投递路径时钟审计、会话关联、日历事件汇总、
-                 MIME 树比较、HTTP 端到端）
+                 MIME 树比较、批量撤销归档、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -105,11 +106,95 @@ curl -X POST http://localhost:8000/messages \
 再次提交语义相同但字节不同（换行、头大小写、boundary、CTE 不同）的邮件，
 返回同一 `id` 与 `fingerprint`，`created` 为 `false`。
 
+## 批量撤销归档（按 id + 当前指纹）
+
+```bash
+# 预览（不删除任何数据）
+curl -X POST http://localhost:8000/messages/unarchive \
+     -H 'Content-Type: application/json' \
+     -d '{"preview": true, "messages": [
+            {"id": 1, "fingerprint": "58d92498…431"},
+            {"id": 2, "fingerprint": "78d5be53…d01b1"}]}'
+
+# 执行（省略 preview 或 preview=false）
+curl -X POST http://localhost:8000/messages/unarchive \
+     -H 'Content-Type: application/json' \
+     -d '{"messages": [
+            {"id": 1, "fingerprint": "58d92498…431"},
+            {"id": 2, "fingerprint": "78d5be53…d01b1"}]}'
+```
+
+归档管理员按**邮件 id 与该邮件的当前指纹**批量撤销归档。指纹是乐观并发
+凭据：请求时携带的指纹必须与库中**当前**指纹逐字符一致，防止撤错版本。
+以下情况**拒绝整批、数据不变**：
+
+| 状态码 | 错误码 `detail.code` | 触发条件 |
+| ---- | ---- | ---- |
+| **422** | `UNARCHIVE_EMPTY_BATCH` | `messages` 为空列表（至少需要一个目标） |
+| **422** | `UNARCHIVE_DUPLICATE_ID` | 请求中同一 id 出现多次（`detail.id` / `detail.index` 定位首个重复项） |
+| **404** | `UNARCHIVE_MESSAGE_NOT_FOUND` | 任一 id 不存在或已被撤销（`detail.id`，按 id 升序报告首个缺失项） |
+| **409** | `UNARCHIVE_FINGERPRINT_MISMATCH` | 任一指纹与当前归档指纹不符（`detail.id` / `detail.provided_fingerprint` / `detail.current_fingerprint`） |
+
+请求体不合规（缺 `messages`、`id` 非正整数、`fingerprint` 为空）返回
+FastAPI 参数校验 **422**。
+
+**预览与执行使用同一影响计算**（`preview=true` 为纯只读，不落库），
+响应：
+
+- `executed`：是否实际执行（预览 `false`，执行 `true`）；
+- `targets`：目标邮件**按 id 升序**，每项含 `id` / `fingerprint` /
+  `content_type` / `size_bytes` / `created_at` 与
+  **`attachment_refs_removed`**（该邮件将移除的附件引用行数，即 blob
+  出现次数，同一内容出现多次按多行计）；
+- `orphaned_attachments`：**仅在本批删除后才无人引用**的附件，按
+  SHA-256 升序，给出 `sha256` 与 `size_bytes`；仍被批外其他邮件引用
+  的附件**不出现**；
+- `attachment_refs_removed`：本批移除的引用行数合计；
+  `orphaned_attachment_count`：将清理的去重附件实体数；
+  `reclaimed_bytes`：无人引用附件的字节合计（同一内容无论被引用多少次
+  只计一份字节）。
+
+```json
+{
+  "executed": false,
+  "target_count": 2,
+  "attachment_refs_removed": 3,
+  "orphaned_attachment_count": 1,
+  "reclaimed_bytes": 40,
+  "targets": [
+    {"id": 1, "fingerprint": "58d92498…431", "content_type": "multipart/mixed",
+     "size_bytes": 380, "created_at": "2026-09-21T03:06:15.676328+00:00",
+     "attachment_refs_removed": 2},
+    {"id": 2, "fingerprint": "78d5be53…d01b1", "content_type": "multipart/mixed",
+     "size_bytes": 291, "created_at": "2026-09-21T03:07:01.112233+00:00",
+     "attachment_refs_removed": 1}
+  ],
+  "orphaned_attachments": [
+    {"sha256": "c1e372ae…8001", "size_bytes": 40}
+  ]
+}
+```
+
+**执行语义**：在单个 `BEGIN IMMEDIATE` 事务内重新校验全部凭据后，
+依次删除目标邮件的附件引用 → **仅**无人引用的附件实体（删除语句再以
+`NOT EXISTS` 兜底，绝不删除仍被引用的字节）→ 邮件的全部 MIME 节点 →
+邮件本身；影响行数与预期不符或任何步骤失败均**整体回滚**，数据库回到
+撤销前状态。撤销后：
+
+- 目标邮件及其节点、附件引用不可再查（`/messages/{id}` 返回 404）；
+- 仅被目标邮件引用的附件实体与字节一并清理，`/attachments` 不再列出；
+- 仍被**其他邮件**引用的附件字节完整保留，`/attachments` 可查、
+  `/attachments/{sha256}/content` 可下载（含 `Range`），其
+  `occurrences` / `reference_count` 只反映剩余引用；
+- 撤销后重新归档同一封邮件会作为新行入库（指纹相同但 id 不同，
+  `created=true`）。
+
 ## 查询
 
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
 | GET | `/messages` | 列表（`limit`、`offset` 分页） |
+| POST | `/messages/unarchive` | **按 id + 当前指纹批量撤销归档**（可预览，见下） |
 | GET | `/messages/{id}` | 邮件元信息 |
 | GET | `/messages/{id}/tree` | **嵌套 MIME 树** |
 | GET | `/messages/{id}/nodes` | 全部节点（扁平，children 为路径） |
@@ -1092,6 +1177,9 @@ curl -H 'Range: bytes=-50'   http://localhost:8000/attachments/c1e372ae…/conte
 | `AMBIGUOUS_RELATED_START` / `RELATED_START_NOT_FOUND` | `display-body` 查询时 multipart/related 的 `start` 重复命中或未命中（查询期错误，不改写记录） |
 | `MULTIPLE_DELIVERY_STATUS` / `DELIVERY_STATUS_NOT_FOUND` / `DELIVERY_STATUS_UNREADABLE` / `INVALID_DELIVERY_STATUS` / `MISSING_DELIVERY_FIELD` / `INVALID_DELIVERY_FIELD` | `delivery-report` 查询时 DSN 作用域结构或 `message/delivery-status` 字段非法（查询期错误，不改写记录） |
 | `ATTACHMENT_BYTES_UNAVAILABLE` | `attachments.zip` 打包时 blob 节点的解码字节在附件库中缺失（邮件归档于附件字节留存升级之前），`node_path` 定位该节点 |
+| `UNARCHIVE_EMPTY_BATCH` / `UNARCHIVE_DUPLICATE_ID` | 批量撤销请求为空列表或含重复 id（422，整批拒绝、数据不变） |
+| `UNARCHIVE_MESSAGE_NOT_FOUND` | 批量撤销目标 id 不存在或已被撤销（404，整批拒绝、数据不变） |
+| `UNARCHIVE_FINGERPRINT_MISMATCH` | 批量撤销目标的指纹与当前归档指纹不符（409，整批拒绝、数据不变；`detail` 给出提供值与当前值） |
 
 `/calendar/events` 的日历问题**不是错误响应**：接口始终返回 200，
 `MISSING_CALENDAR_FIELD` / `INVALID_CALENDAR_TIME` /

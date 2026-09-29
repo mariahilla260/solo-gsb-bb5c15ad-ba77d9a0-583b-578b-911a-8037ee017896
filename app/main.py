@@ -30,6 +30,10 @@ from .mimeparser import fingerprint, parse_message, raw_sha256
 from .related import audit_related_resources
 from .routingaudit import audit_routing
 from .threading import build_thread
+from .unarchive import (
+    UnarchiveValidationError,
+    validate_and_compute_impact,
+)
 from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
@@ -74,6 +78,11 @@ from .schemas import (
     ThreadResponse,
     TreeNode,
     TreeResponse,
+    UnarchiveItemRequest,
+    UnarchiveOrphanedAttachment,
+    UnarchiveRequest,
+    UnarchiveResponse,
+    UnarchiveTarget,
 )
 from .security import (
     DEFAULT_MAX_ATTACHMENT_COUNT,
@@ -143,8 +152,14 @@ app = FastAPI(
         "歧义时间、同一节点重复 UID 逐项诊断（带 message_id/node_path），"
         "跨邮件同 UID 按 SEQUENCE/DTSTAMP/message_id 选当前版本，CANCEL "
         "标为已取消并保留来源，按起始时间与 UID 稳定排序。"
+        "POST /messages/unarchive 按 {id, 当前指纹} 批量撤销归档：空列表、"
+        "重复 id、邮件缺失或指纹不符拒绝整批且数据不变；preview=true 与"
+        "执行共用同一影响计算（目标按 id 升序、将移除的附件引用数、仅本批"
+        "删除后无人引用的附件 SHA-256 与可回收字节），执行在单个 "
+        "BEGIN IMMEDIATE 事务内删除邮件/节点/引用并仅清理无人引用的附件，"
+        "仍被其他邮件引用的字节保留可查可下载，任何失败整体回滚。"
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -162,6 +177,24 @@ async def mime_parse_error_handler(request: Request, exc: MIMEParseError):
     from fastapi.responses import JSONResponse
 
     return JSONResponse(status_code=422, content=exc.to_dict())
+
+
+@app.exception_handler(UnarchiveValidationError)
+async def unarchive_validation_error_handler(
+    request: Request, exc: UnarchiveValidationError
+):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": {
+                "code": exc.code,
+                "message": exc.message,
+                **exc.detail,
+            }
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +326,75 @@ async def create_message(
         size_bytes=row["size_bytes"],
         created=created,
         node_count=node_count,
+    )
+
+
+@app.post("/messages/unarchive", response_model=UnarchiveResponse)
+def unarchive_messages(
+    payload: UnarchiveRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> UnarchiveResponse:
+    """按 ``{id, fingerprint}`` 批量撤销归档（可预览）。
+
+    请求包含一个或多个目标，每项目标给出归档 **id** 与该邮件的**当前
+    指纹**（乐观并发凭据）。以下情况**拒绝整批、数据不变**：
+
+    * 空目标列表 / id 重复：**422**（``UNARCHIVE_EMPTY_BATCH`` /
+      ``UNARCHIVE_DUPLICATE_ID``）；
+    * 任一 id 不存在：**404**（``UNARCHIVE_MESSAGE_NOT_FOUND``）；
+    * 任一指纹与当前归档指纹不符：**409**
+      （``UNARCHIVE_FINGERPRINT_MISMATCH``）。
+
+    预览（``preview=true``）与执行使用**同一影响计算**：目标按 id
+    升序返回，含每封邮件将移除的附件引用数；``orphaned_attachments``
+    仅列出**本批删除后才无人引用**的附件 SHA-256 与大小，
+    ``reclaimed_bytes`` 为其字节合计；仍被批外邮件引用的附件不出现、
+    字节保持可查可下载。预览为只读，``executed=false``。
+
+    执行（``preview=false`` 或缺省）在**单个 ``BEGIN IMMEDIATE``
+    事务**内重新校验凭据并删除：目标邮件的附件引用 → 仅无人引用的
+    附件实体（删除再以 ``NOT EXISTS`` 兜底）→ 节点 → 邮件；任何失败
+    整体回滚，成功时 ``executed=true``。
+    """
+
+    items = [(m.id, m.fingerprint) for m in payload.messages]
+
+    if payload.preview:
+        # 纯只读：普通 SELECT 不开启写事务，绝不修改数据。
+        impact = validate_and_compute_impact(conn, items)
+        executed = False
+    else:
+        # BEGIN IMMEDIATE：进入即持写锁，凭据校验与删除原子串行。
+        with database.immediate_transaction(conn):
+            impact = validate_and_compute_impact(conn, items)
+            database.delete_messages_cascade(
+                conn,
+                message_ids=[t.id for t in impact.targets],
+                orphan_sha256s=[o.sha256 for o in impact.orphans],
+            )
+        executed = True
+
+    return UnarchiveResponse(
+        executed=executed,
+        target_count=len(impact.targets),
+        attachment_refs_removed=impact.refs_removed,
+        orphaned_attachment_count=len(impact.orphans),
+        reclaimed_bytes=impact.reclaimed_bytes,
+        targets=[
+            UnarchiveTarget(
+                id=t.id,
+                fingerprint=t.fingerprint,
+                content_type=t.content_type,
+                size_bytes=t.size_bytes,
+                created_at=t.created_at,
+                attachment_refs_removed=t.attachment_refs_removed,
+            )
+            for t in impact.targets
+        ],
+        orphaned_attachments=[
+            UnarchiveOrphanedAttachment(sha256=o.sha256, size_bytes=o.size_bytes)
+            for o in impact.orphans
+        ],
     )
 
 

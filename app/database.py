@@ -129,6 +129,103 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
 
 
+@contextmanager
+def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """立即获取写锁的事务（``BEGIN IMMEDIATE``）。
+
+    用于撤销归档这类“先读校验、再写入删除”的请求：进入事务即拿写锁，
+    使整批的凭据校验与删除对其他写入串行化，避免预览/校验之后、删除
+    之前被并发归档或撤销改写。任何异常（含校验失败）都整体回滚。
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# 撤销归档（删除）
+# ---------------------------------------------------------------------------
+
+
+def delete_messages_cascade(
+    conn: sqlite3.Connection,
+    message_ids: list[int],
+    orphan_sha256s: list[str],
+) -> None:
+    """在**单个事务**内撤销整批邮件并清理无人引用的附件。
+
+    调用方必须已完成凭据校验与影响计算，且事务由
+    :func:`immediate_transaction` 开启。删除顺序：
+
+    1. 目标邮件的全部附件引用（``attachment_refs``）；
+    2. 仅在本批删除后无人引用的附件实体（``attachments``）——批外仍被
+       引用的实体绝不在列表中，字节保持可查可下载；
+    3. 目标邮件的全部 MIME 节点（``nodes``）；
+    4. 目标邮件本身（``messages``）。
+
+    附件实体删除再以 ``NOT EXISTS`` 兜底：即便并发情况下引用计数与
+    预期不同，也绝不删除仍被引用的字节。任何一步影响行数与预期不符即
+    抛错，由事务上下文整体回滚，数据库回到撤销前状态。
+    """
+
+    ids_placeholders = ",".join("?" for _ in message_ids)
+    sha_placeholders = ",".join("?" for _ in orphan_sha256s)
+    expected = len(message_ids)
+
+    cur = conn.execute(
+        f"DELETE FROM attachment_refs WHERE message_id IN ({ids_placeholders})",
+        message_ids,
+    )
+    refs_removed = cur.rowcount
+
+    orphan_removed = 0
+    if orphan_sha256s:
+        # NOT EXISTS 兜底：只删当前确实无任何引用的实体。
+        cur = conn.execute(
+            f"""
+            DELETE FROM attachments
+            WHERE sha256 IN ({sha_placeholders})
+              AND NOT EXISTS (
+                    SELECT 1 FROM attachment_refs r
+                    WHERE r.attachment_sha256 = attachments.sha256
+              )
+            """,
+            orphan_sha256s,
+        )
+        orphan_removed = cur.rowcount
+
+    cur = conn.execute(
+        f"DELETE FROM nodes WHERE message_id IN ({ids_placeholders})",
+        message_ids,
+    )
+    nodes_removed = cur.rowcount
+
+    cur = conn.execute(
+        f"DELETE FROM messages WHERE id IN ({ids_placeholders})",
+        message_ids,
+    )
+    if cur.rowcount != expected:
+        # 凭据在事务内重新校验过，行数不符只可能是存储层异常。
+        raise sqlite3.DatabaseError(
+            f"撤销归档：预期删除 {expected} 封邮件，实际删除 {cur.rowcount} 封"
+        )
+
+    # 附件实体由 NOT EXISTS 兜底时可能少删（引用情况与计算口径不一致），
+    # 属于不应发生的并发异常：抛错回滚整批，保持“失败数据不变”。
+    if orphan_removed != len(orphan_sha256s):
+        raise sqlite3.DatabaseError(
+            "撤销归档：附件引用计数与预期不一致，已回滚整批"
+            f"（预期清理 {len(orphan_sha256s)} 个实体，"
+            f"实际 {orphan_removed} 个；移除引用 {refs_removed} 行、"
+            f"节点 {nodes_removed} 行）"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 写入
 # ---------------------------------------------------------------------------
