@@ -449,11 +449,62 @@ class CalendarEventsResponse(BaseModel):
     diagnostics: list[CalendarDiagnostic]
 
 
+# ---------------------------------------------------------------------------
+# 批量撤销归档（POST /messages/unarchive）
+# ---------------------------------------------------------------------------
+
+
+class UnarchiveItem(BaseModel):
+    """批量撤销请求中的一项：归档 id 与该 id 的当前指纹。"""
+
+    id: int = Field(..., ge=1, description="待撤销邮件的归档 id")
+    fingerprint: str = Field(
+        ..., min_length=1, description="调用方认知的该邮件当前指纹（64 位 hex）"
+    )
+
+
+class UnarchiveRequest(BaseModel):
+    """批量撤销请求；空列表 / 重复 id 由端点显式拒绝（整批不变）。"""
+
+    items: list[UnarchiveItem]
+    preview: bool = Field(
+        False, description="true 只计算影响不执行；false 在单事务内实际删除"
+    )
+
+
+class UnarchiveTarget(BaseModel):
+    """受影响的一封目标邮件（按 id 升序返回）。"""
+
+    id: int
+    fingerprint: str
+    content_type: str
+    size_bytes: int
+    node_count: int  # 将移除的节点行数（含根节点）
+    attachment_refs_removed: int  # 该邮件将移除的附件引用数（blob 叶子数）
+
+
+class UnarchiveAttachment(BaseModel):
+    """本批删除后不再被任何邮件引用、将被（或已被）清理的附件。"""
+
+    sha256: str
+    size_bytes: int
+    media_type: str
+
+
+class UnarchiveResponse(BaseModel):
+    preview: bool
+    executed: bool  # 与 preview 相反：true 表示已实际删除并提交
+    targets: list[UnarchiveTarget]  # 按 id 升序
+    attachments_removed: list[UnarchiveAttachment]  # 将/已清理的无引用附件，按 sha256 升序
+    reclaimed_bytes: int  # 将/已回收的附件字节合计（无引用附件 size 之和）
+    attachment_refs_removed: int  # 整批将移除的附件引用总数
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str
-    node_path: str
-    detail: dict
+    node_path: str = ""
+    detail: dict = {}
 
 
 class ErrorResponse(BaseModel):

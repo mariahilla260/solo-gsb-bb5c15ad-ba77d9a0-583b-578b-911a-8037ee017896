@@ -35,13 +35,13 @@ app/
   calendar.py    日历事件汇总（text/calendar 单次 VEVENT 解析、TZID 折 UTC、夏令时诊断、跨邮件版本选择，纯只读）
   compare.py     两封邮件 MIME 树递归对齐比较（内容指纹配对、重排识别、歧义标记，纯只读）
   archive.py     整邮件附件 ZIP 打包（确定性条目/压缩、名称冲突改名、manifest.json，纯只读）
-  database.py    SQLite 建表、事务化写入、消息/节点/附件查询
-  errors.py      定位到节点的解析错误
+  database.py    SQLite 建表、事务化写入、消息/节点/附件查询、批量撤销（单事务删除与无引用附件清理）
+  errors.py      定位到节点的解析错误、批量撤销整批拒绝错误
   schemas.py     请求/响应模型
-tests/           416 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+tests/           437 个 pytest 用例（指纹稳定性、损坏输入、附件库、
                  整邮件 ZIP、cid 引用审计、展示正文选择、安全策略评估、
                  DSN 投递状态、投递路径时钟审计、会话关联、日历事件汇总、
-                 MIME 树比较、HTTP 端到端）
+                 MIME 树比较、批量撤销归档、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -121,6 +121,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/routing-audit` | 从 `Received` 头重建投递路径并审计时钟倒退/回环/坏头（见下） |
 | GET | `/messages/{id}/thread` | 会话关联查询：回复图、断链与拓扑排序（见下） |
 | GET | `/messages/{id}/attachments.zip` | **整邮件附件 ZIP**：文档序逐 blob 出现打包 + 内置 manifest（见下） |
+| POST | `/messages/unarchive` | **批量撤销归档**：按 `{id, fingerprint}` 预览/删除，仅清理无人引用的附件（见下） |
 | POST | `/messages/compare` | 只读比较两封已归档邮件的 MIME 树（见下） |
 | GET | `/calendar/events` | **跨全部归档邮件**汇总 `text/calendar` 单次 VEVENT（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
@@ -774,6 +775,115 @@ unzip -p attachments.zip manifest.json | python3 -m json.tool
   错误码 `ATTACHMENT_BYTES_UNAVAILABLE`，`node_path` 定位到缺字节
   的 blob 节点。
 
+## 批量撤销归档
+
+```bash
+# 先预览（不改动任何数据）
+curl -X POST http://localhost:8000/messages/unarchive \
+     -H 'Content-Type: application/json' \
+     -d '{
+           "preview": true,
+           "items": [
+             {"id": 1, "fingerprint": "58d92498…431"},
+             {"id": 4, "fingerprint": "0cda5052…efe"}
+           ]
+         }'
+
+# 确认影响无误后实际执行（省略 preview 或置 false）
+curl -X POST http://localhost:8000/messages/unarchive \
+     -H 'Content-Type: application/json' \
+     -d '{"items": [{"id": 1, "fingerprint": "58d92498…431"}]}'
+```
+
+归档管理员按**邮件 id + 该邮件当前指纹**批量撤销归档。指纹是乐观
+并发校验：调用方需先持有邮件的当前指纹（来自 `POST /messages` 或
+`GET /messages` / `/messages/{id}` 的响应），指纹不符说明邮件在调用方
+读取后发生过变化（或调用方认知有误），整批拒绝。
+
+### 请求
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `items` | **一个或多个** `{id, fingerprint}`；空列表拒绝整批 |
+| `preview` | `true` 只计算影响、**不改动数据**；缺省 `false` 实际执行 |
+
+- **预览与执行使用同一影响计算**，唯一区别是 `executed` 字段与数据是否
+  真的删除——可以先用 `preview=true` 审阅，再以同样的 `items` 执行；
+- 同一 `id` 在 `items` 中重复出现会被拒绝（整批不变）。
+
+### 影响计算（响应体）
+
+目标邮件**按 id 升序**返回，附件**按 SHA-256 升序**返回，重复请求
+结果稳定：
+
+| 字段 | 含义 |
+| ---- | ---- |
+| `preview` / `executed` | 是否预览 / 是否实际执行（互为反义） |
+| `targets[]` | 每封目标邮件：`id`、当前 `fingerprint`、`content_type`、`size_bytes`、`node_count`（将移除的节点行数，含根节点）、`attachment_refs_removed`（该邮件将移除的附件引用数，即 blob 叶子数） |
+| `attachments_removed[]` | **仅在本批全部删除后**不再被任何邮件引用的附件：`sha256` / `size_bytes` / `media_type` |
+| `reclaimed_bytes` | 上述无引用附件的字节合计（可回收空间） |
+| `attachment_refs_removed` | 整批将移除的附件引用总数（各目标之和） |
+
+**关键语义**：一个附件只要还被**任意一封不在本批中的邮件**引用，就
+**不会**出现在 `attachments_removed` 中，其实体字节继续保留，可在
+`GET /attachments` 检索、`GET /attachments/{sha256}/content` 下载、
+仍能被其他邮件的 `attachments.zip` 打包。仅当删除本批后引用计数归零时
+才清理实体；同一内容在本批多封邮件中各引用一次，实体也只回收一次。
+
+预览响应示例（撤销邮件 1 与 3；PDF 被本批独占故可回收，PNG 仍被
+未在批内的邮件 2 引用故保留）：
+
+```json
+{
+  "preview": true,
+  "executed": false,
+  "targets": [
+    {"id": 1, "fingerprint": "d0c0c083…fe197", "content_type": "multipart/mixed",
+     "size_bytes": 445, "node_count": 3, "attachment_refs_removed": 2},
+    {"id": 3, "fingerprint": "079ab0f3…c356a", "content_type": "text/plain",
+     "size_bytes": 29, "node_count": 1, "attachment_refs_removed": 0}
+  ],
+  "attachments_removed": [
+    {"sha256": "0d834837…7f23c", "size_bytes": 39, "media_type": "application/pdf"}
+  ],
+  "reclaimed_bytes": 39,
+  "attachment_refs_removed": 2
+}
+```
+
+### 执行的事务保证
+
+`preview=false` 时，删除在**单个 SQLite 事务**（`BEGIN IMMEDIATE`，
+全程持保留锁与其他写请求串行）内完成，顺序为：
+
+1. 事务内复核全部目标 id 仍存在（防止并发撤销竞争）；
+2. 删除本批目标在 `attachment_refs` 中的引用行；
+3. 删除目标在 `nodes` 中的全部 MIME 节点；
+4. 删除 `messages` 行；
+5. **只删除**删除后引用计数归零的 `attachments` 实体（带
+   `NOT EXISTS` 剩余引用守卫）。
+
+任何一步失败（SQL 错误、复核不一致、并发冲突）**整批回滚**，邮件、
+节点、引用、附件实体保持原状，接口返回错误。撤销不可恢复——执行前
+请先用预览确认。
+
+### 错误（全部整批拒绝、数据不变）
+
+错误响应统一为 `{"error": {"code", "message", "detail"}}`：
+
+| 状态码 | `code` | 条件（`detail`） |
+| ---- | ---- | ---- |
+| **422** | `UNARCHIVE_EMPTY_BATCH` | `items` 为空列表 |
+| **422** | —（FastAPI 校验） | 请求体缺 `items`、`id` 非正整数、`fingerprint` 非非空字符串等 |
+| **422** | `UNARCHIVE_DUPLICATE_IDS` | `items` 含重复 id（`detail.ids`） |
+| **404** | `UNARCHIVE_MESSAGE_NOT_FOUND` | 任一 id 不存在（`detail.ids`，按 id 升序） |
+| **409** | `UNARCHIVE_FINGERPRINT_MISMATCH` | 任一指纹与当前指纹不符（`detail.items[]`：`id` / 请求 `fingerprint` / `current_fingerprint`） |
+| **409** | `UNARCHIVE_CONFLICT` | 执行期事务内复核发现并发改动，已整批回滚 |
+| **500** | — | 删除过程中发生意外错误，事务已回滚、数据不变 |
+
+校验顺序固定为：空列表 → 重复 id → 邮件不存在 → 指纹不符（因此同一
+请求同时缺 id 且指纹错误时，先报 404）。预览路径执行完全相同的校验。
+
 ## 两封邮件 MIME 树比较
 
 ```bash
@@ -1073,6 +1183,8 @@ curl -H 'Range: bytes=-50'   http://localhost:8000/attachments/c1e372ae…/conte
 `node_path` 指向出问题的 MIME 节点（根节点为 `""`）。解析在写库之前
 **完整完成**，因此失败请求不会在 `messages` / `nodes` / `attachments` /
 `attachment_refs` 表中留下任何行；写库本身也在单事务内，中途出错整体回滚。
+批量撤销（`POST /messages/unarchive`）的错误体不带 `node_path`
+（为跨邮件的批量操作），具体码与状态码见上文“批量撤销归档”。
 
 错误码：
 

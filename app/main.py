@@ -25,7 +25,7 @@ from .calendar import _format_utc, collect_calendar_events
 from .compare import compare_messages
 from .delivery import extract_delivery_reports
 from .displaybody import select_display_body
-from .errors import MIMEParseError
+from .errors import MIMEParseError, UnarchiveError
 from .mimeparser import fingerprint, parse_message, raw_sha256
 from .related import audit_related_resources
 from .routingaudit import audit_routing
@@ -74,6 +74,10 @@ from .schemas import (
     ThreadResponse,
     TreeNode,
     TreeResponse,
+    UnarchiveAttachment,
+    UnarchiveRequest,
+    UnarchiveResponse,
+    UnarchiveTarget,
 )
 from .security import (
     DEFAULT_MAX_ATTACHMENT_COUNT,
@@ -143,8 +147,14 @@ app = FastAPI(
         "歧义时间、同一节点重复 UID 逐项诊断（带 message_id/node_path），"
         "跨邮件同 UID 按 SEQUENCE/DTSTAMP/message_id 选当前版本，CANCEL "
         "标为已取消并保留来源，按起始时间与 UID 稳定排序。"
+        "POST /messages/unarchive 按邮件 id 与当前指纹批量撤销归档："
+        "空列表/重复 id/缺失邮件/指纹不符整批拒绝且数据不变；可预览"
+        "（preview=true，与执行同口径计算目标、移除引用数与仅本批后"
+        "无人引用的附件及可回收字节）；执行在单事务内删除目标邮件/"
+        "节点/引用，仅清理无人引用的附件，仍被引用的字节保留可下载，"
+        "任一失败整批回滚。"
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -162,6 +172,31 @@ async def mime_parse_error_handler(request: Request, exc: MIMEParseError):
     from fastapi.responses import JSONResponse
 
     return JSONResponse(status_code=422, content=exc.to_dict())
+
+
+@app.exception_handler(UnarchiveError)
+async def unarchive_error_handler(request: Request, exc: UnarchiveError):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
+
+
+@app.exception_handler(database.UnarchiveConflict)
+async def unarchive_conflict_handler(
+    request: Request, exc: database.UnarchiveConflict
+):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "UNARCHIVE_CONFLICT",
+                "message": str(exc),
+                "detail": {},
+            }
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +445,145 @@ def compare_two_messages(
         identical=len(diffs) == 0,
         summary=CompareSummary(**counts),
         diffs=items,
+    )
+
+
+def _unarchive_error(
+    status_code: int, code: str, message: str, detail: dict
+) -> UnarchiveError:
+    """批量撤销的结构化错误（响应体由异常处理器包成 ``{"error": {...}}``）。"""
+
+    return UnarchiveError(status_code, code, message, detail)
+
+
+@app.post("/messages/unarchive", response_model=UnarchiveResponse)
+def unarchive_messages(
+    payload: UnarchiveRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> UnarchiveResponse:
+    """按 ``{id, fingerprint}`` 批量撤销归档，支持预览。
+
+    请求体 ``items`` 为一项或多项 ``{id, fingerprint}``，``preview=true``
+    只返回影响、**不改动任何数据**；``preview=false``（缺省）在**单个
+    事务**内删除目标邮件、节点与附件引用，且只清理删除后**无人引用**的
+    附件实体——仍被其他邮件引用的附件字节保留，可继续在 ``/attachments``
+    查询与下载。任何失败（含事务内并发复核失败）整批回滚、数据不变。
+
+    **整批拒绝、数据不变**的情形：
+
+    * ``items`` 为空 → **422** ``UNARCHIVE_EMPTY_BATCH``；
+    * 出现重复 id → **422** ``UNARCHIVE_DUPLICATE_IDS``（``detail.ids``）；
+    * 任一 id 不存在 → **404** ``UNARCHIVE_MESSAGE_NOT_FOUND``
+      （``detail.ids``）；
+    * 任一指纹与该 id 的当前指纹不符 → **409**
+      ``UNARCHIVE_FINGERPRINT_MISMATCH``（``detail.items`` 给出 id、
+      请求指纹与当前指纹）；
+    * 执行期与并发撤销竞争 → **409** ``UNARCHIVE_CONFLICT``，整批回滚。
+
+    预览与执行使用**同一影响计算**：目标邮件按 id 升序返回，逐项给出
+    将移除的节点数与附件引用数；``attachments_removed`` 列出仅在本批
+    删除后才无人引用的附件（sha256 升序）及 ``reclaimed_bytes`` 合计。
+    """
+
+    # 1) 空列表 / 重复 id：纯结构校验，拒绝整批。
+    if not payload.items:
+        raise _unarchive_error(
+            422,
+            "UNARCHIVE_EMPTY_BATCH",
+            "撤销列表为空：items 至少需要一个 {id, fingerprint}",
+            {},
+        )
+    seen: set[int] = set()
+    duplicates: list[int] = []
+    for item in payload.items:
+        if item.id in seen and item.id not in duplicates:
+            duplicates.append(item.id)
+        seen.add(item.id)
+    if duplicates:
+        raise _unarchive_error(
+            422,
+            "UNARCHIVE_DUPLICATE_IDS",
+            f"撤销列表含重复 id：{sorted(duplicates)}",
+            {"ids": sorted(duplicates)},
+        )
+
+    requested = {item.id: item.fingerprint for item in payload.items}
+    ordered_ids = sorted(requested)
+
+    # 2) 存在性校验：任一缺失即拒绝整批。
+    placeholders = ",".join("?" for _ in ordered_ids)
+    rows = conn.execute(
+        f"SELECT id, fingerprint FROM messages WHERE id IN ({placeholders})",
+        ordered_ids,
+    ).fetchall()
+    found = {int(r["id"]): r["fingerprint"] for r in rows}
+    missing = [mid for mid in ordered_ids if mid not in found]
+    if missing:
+        raise _unarchive_error(
+            404,
+            "UNARCHIVE_MESSAGE_NOT_FOUND",
+            f"邮件不存在：{missing}",
+            {"ids": missing},
+        )
+
+    # 3) 指纹校验：任一不符即拒绝整批（乐观并发，按 id 升序报错）。
+    mismatches = [
+        {
+            "id": mid,
+            "fingerprint": requested[mid],
+            "current_fingerprint": found[mid],
+        }
+        for mid in ordered_ids
+        if requested[mid] != found[mid]
+    ]
+    if mismatches:
+        raise _unarchive_error(
+            409,
+            "UNARCHIVE_FINGERPRINT_MISMATCH",
+            "一个或多个邮件的指纹与当前归档不一致，整批未执行",
+            {"items": mismatches},
+        )
+
+    # 4) 影响计算（预览与执行同口径）。
+    plan = database.build_unarchive_plan(conn, ordered_ids)
+
+    if payload.preview:
+        return _unarchive_response(plan, executed=False)
+
+    # 5) 执行：单事务删除 + 仅清理无引用附件；失败由异常处理器/事务回滚。
+    # 返回事务锁内重新确认的权威影响（与预览同口径，不一致已在事务内
+    # 回滚并抛 UNARCHIVE_CONFLICT），据此构造已执行响应。
+    executed_plan = database.delete_messages(conn, ordered_ids)
+    return _unarchive_response(executed_plan, executed=True)
+
+
+def _unarchive_response(
+    plan: database.UnarchivePlan, *, executed: bool
+) -> UnarchiveResponse:
+    return UnarchiveResponse(
+        preview=not executed,
+        executed=executed,
+        targets=[
+            UnarchiveTarget(
+                id=t.id,
+                fingerprint=t.fingerprint,
+                content_type=t.content_type,
+                size_bytes=t.size_bytes,
+                node_count=t.node_count,
+                attachment_refs_removed=t.attachment_refs_removed,
+            )
+            for t in plan.targets
+        ],
+        attachments_removed=[
+            UnarchiveAttachment(
+                sha256=a.sha256,
+                size_bytes=a.size_bytes,
+                media_type=a.media_type,
+            )
+            for a in plan.orphans
+        ],
+        reclaimed_bytes=plan.reclaimed_bytes,
+        attachment_refs_removed=plan.total_refs_removed,
     )
 
 

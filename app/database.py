@@ -26,6 +26,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator, Optional
 
@@ -554,3 +555,239 @@ def count_attachments(
         "SELECT COUNT(*) AS c FROM attachments a" + where, params
     ).fetchone()
     return int(row["c"])
+
+
+# ---------------------------------------------------------------------------
+# 批量撤销归档（预览影响计算 + 单事务删除）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UnarchiveTargetInfo:
+    """撤销影响中的一封目标邮件。"""
+
+    id: int
+    fingerprint: str
+    content_type: str
+    size_bytes: int
+    node_count: int
+    attachment_refs_removed: int
+
+
+@dataclass(frozen=True)
+class UnarchiveAttachmentInfo:
+    """撤销后无人引用、可被清理的附件实体。"""
+
+    sha256: str
+    size_bytes: int
+    media_type: str
+
+
+@dataclass(frozen=True)
+class UnarchivePlan:
+    """预览与执行共用的影响计算结果。
+
+    :param targets: 目标邮件，按 id 升序
+    :param orphans: 本批删除后无任何剩余引用的附件，按 sha256 升序
+    """
+
+    targets: list[UnarchiveTargetInfo]
+    orphans: list[UnarchiveAttachmentInfo]
+
+    @property
+    def total_refs_removed(self) -> int:
+        return sum(t.attachment_refs_removed for t in self.targets)
+
+    @property
+    def reclaimed_bytes(self) -> int:
+        return sum(a.size_bytes for a in self.orphans)
+
+
+class UnarchiveConflict(Exception):
+    """事务内复核发现目标行已被并发改写/删除（整批回滚，未改动数据）。"""
+
+
+def _fetch_messages_for_unarchive(
+    conn: sqlite3.Connection, message_ids: list[int]
+) -> dict[int, sqlite3.Row]:
+    """按 id 批量读取邮件行；调用方须保证 message_ids 非空、无重复。"""
+
+    placeholders = ",".join("?" for _ in message_ids)
+    rows = conn.execute(
+        f"SELECT * FROM messages WHERE id IN ({placeholders})",
+        message_ids,
+    ).fetchall()
+    return {int(r["id"]): r for r in rows}
+
+
+def build_unarchive_plan(
+    conn: sqlite3.Connection, message_ids: list[int]
+) -> UnarchivePlan:
+    """只读计算撤销一批邮件的影响（预览与执行共用同一口径）。
+
+    调用方负责事先校验 id 存在且指纹匹配。结果：
+
+    * ``targets``：目标邮件按 **id 升序**，含将移除的节点数
+      （``node_count``）与该邮件的附件引用数（blob 叶子数）；
+    * ``orphans``：仅当**本批全部目标删除后**，在
+      ``attachment_refs`` 中不再有任何引用行的附件，按 sha256 升序；
+      仍被非目标邮件引用的附件不出现，其字节保持可查可下载。
+    """
+
+    msg_rows = _fetch_messages_for_unarchive(conn, message_ids)
+    targets: list[UnarchiveTargetInfo] = []
+    for mid in sorted(message_ids):
+        row = msg_rows[mid]
+        node_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM nodes WHERE message_id = ?",
+                (mid,),
+            ).fetchone()["c"]
+        )
+        ref_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM attachment_refs WHERE message_id = ?",
+                (mid,),
+            ).fetchone()["c"]
+        )
+        targets.append(
+            UnarchiveTargetInfo(
+                id=mid,
+                fingerprint=row["fingerprint"],
+                content_type=row["content_type"],
+                size_bytes=int(row["size_bytes"]),
+                node_count=node_count,
+                attachment_refs_removed=ref_count,
+            )
+        )
+
+    placeholders = ",".join("?" for _ in message_ids)
+    orphan_rows = conn.execute(
+        f"""
+        SELECT a.sha256 AS sha256, a.size_bytes AS size_bytes,
+               a.media_type AS media_type
+        FROM attachments a
+        WHERE EXISTS (
+                  SELECT 1 FROM attachment_refs r
+                  WHERE r.attachment_sha256 = a.sha256
+                    AND r.message_id IN ({placeholders})
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM attachment_refs r
+                  WHERE r.attachment_sha256 = a.sha256
+                    AND r.message_id NOT IN ({placeholders})
+              )
+        ORDER BY a.sha256
+        """,
+        (*message_ids, *message_ids),
+    ).fetchall()
+    orphans = [
+        UnarchiveAttachmentInfo(
+            sha256=r["sha256"],
+            size_bytes=int(r["size_bytes"]),
+            media_type=r["media_type"],
+        )
+        for r in orphan_rows
+    ]
+    return UnarchivePlan(targets=targets, orphans=orphans)
+
+
+def delete_messages(conn: sqlite3.Connection, message_ids: list[int]) -> UnarchivePlan:
+    """在**单个事务**内撤销一批邮件，返回事务内确认的实际影响计划。
+
+    删除顺序：先 ``attachment_refs``（本批目标的引用行）→ 再 ``nodes``
+    → 再 ``messages``（外键 ``ON DELETE CASCADE`` 仅作兜底）→ 最后只删除
+    引用计数归零的 ``attachments`` 实体。仍被其他邮件引用的附件字节不动。
+
+    目标计数（节点数/引用数）与将清理的附件集在**同一事务、同一保留锁**
+    内重新计算并校验，因此返回的 :class:`UnarchivePlan` 与真实落库结果
+    严格一致（也与执行前的预览同口径，二者不一致即抛
+    :class:`UnarchiveConflict` 并整体回滚）。
+
+    显式 ``BEGIN IMMEDIATE`` 在事务开始即取得保留锁，使“复核 → 删除 →
+    清理”全程与其他写请求串行化；为避免 Python sqlite3 旧版隔离模式在
+    显式事务前自动注入隐式 ``BEGIN``，这里临时切换到
+    ``isolation_level=None`` 自行管理事务。
+    """
+
+    ordered_ids = sorted(set(message_ids))
+    placeholders = ",".join("?" for _ in ordered_ids)
+
+    prev_isolation = conn.isolation_level
+    conn.isolation_level = None  # autocommit：模块不再自动注入 BEGIN/COMMIT
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            plan = _delete_messages_locked(conn, ordered_ids, placeholders)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.isolation_level = prev_isolation
+    return plan
+
+
+def _delete_messages_locked(
+    conn: sqlite3.Connection, ordered_ids: list[int], placeholders: str
+) -> UnarchivePlan:
+    """``BEGIN IMMEDIATE`` 之后的实际删除步骤（调用方负责提交/回滚）。"""
+
+    # 1) 事务内复核：目标仍全部存在（缺失说明与并发请求竞争）。
+    found = {
+        int(r["id"])
+        for r in conn.execute(
+            f"SELECT id FROM messages WHERE id IN ({placeholders})",
+            ordered_ids,
+        ).fetchall()
+    }
+    if len(found) != len(ordered_ids):
+        missing = [i for i in ordered_ids if i not in found]
+        raise UnarchiveConflict(
+            f"事务内复核失败：邮件 {missing} 已不存在（可能被并发撤销）"
+        )
+
+    # 2) 锁内重新计算影响（与预览同口径），作为最终响应的权威数据。
+    plan = build_unarchive_plan(conn, ordered_ids)
+    orphan_digests = [a.sha256 for a in plan.orphans]
+
+    # 3) 删除本批目标的附件引用行、MIME 节点行与邮件行。
+    conn.execute(
+        f"DELETE FROM attachment_refs WHERE message_id IN ({placeholders})",
+        ordered_ids,
+    )
+    conn.execute(
+        f"DELETE FROM nodes WHERE message_id IN ({placeholders})",
+        ordered_ids,
+    )
+    cur = conn.execute(
+        f"DELETE FROM messages WHERE id IN ({placeholders})",
+        ordered_ids,
+    )
+    if cur.rowcount != len(ordered_ids):
+        # 已持保留锁，复核与删除之间不可能插入并发写；命中说明不变量
+        # 被破坏，整体回滚。
+        raise UnarchiveConflict(
+            f"预期删除 {len(ordered_ids)} 封邮件，实际 {cur.rowcount} 封"
+        )
+
+    # 4) 仅清理引用已归零的附件实体；存在剩余引用者绝不动。
+    if orphan_digests:
+        oph = ",".join("?" for _ in orphan_digests)
+        deleted = conn.execute(
+            f"""
+            DELETE FROM attachments
+            WHERE sha256 IN ({oph})
+              AND NOT EXISTS (
+                      SELECT 1 FROM attachment_refs r
+                      WHERE r.attachment_sha256 = attachments.sha256
+                  )
+            """,
+            orphan_digests,
+        ).rowcount
+        if deleted != len(orphan_digests):
+            raise UnarchiveConflict(
+                f"预期清理 {len(orphan_digests)} 个无引用附件，"
+                f"实际 {deleted} 个"
+            )
+    return plan
